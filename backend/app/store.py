@@ -24,8 +24,15 @@ class Store:
         self._idempotency: dict[str, dict[str, Any]] = {}
         # 冻结标记：被不合格处置关联的记录 id -> True
         self._frozen: dict[tuple[str, int], str] = {}
+        # 试配审评：sample_id -> 评审签结版本列表（不可变，更正只追加新版本）
+        self._blend_signoffs: dict[int, list[dict[str, Any]]] = {}
+        # 试配审评：配方确认回执列表（快照确认当时的签结内容）
+        self._blend_receipts: list[dict[str, Any]] = []
+        self._receipt_by_signoff: dict[int, dict[str, Any]] = {}
         # 初始化建种子血缘索引
         self._build_lineage_from_seed()
+        # 迁移种子数据中内嵌的签结与回执到独立存档
+        self._load_blend_review_seed()
 
     # ── 表操作 ──
 
@@ -151,6 +158,70 @@ class Store:
         output_weight = round(input_weight * (1.0 - loss_rate), 3)
         row["产出重量"] = output_weight
         return output_weight
+
+    # ── 试配审评存档 ──
+
+    def _load_blend_review_seed(self) -> None:
+        """把种子小样内嵌的签结历史与确认回执迁移到独立存档。
+
+        种子数据为可读起见把存档写在行内，运行期统一走独立存档，
+        迁移后行内只保留可派生的引用字段。
+        """
+        for row in self.rows("blend_sample"):
+            sample_id = int(row["id"])
+            embedded = row.pop("_seed_signoffs", None)
+            if embedded:
+                self._blend_signoffs[sample_id] = [dict(item) for item in embedded]
+            receipt = row.pop("_seed_receipt", None)
+            if receipt:
+                self._blend_receipts.append(dict(receipt))
+                signoff_id = int(receipt.get("signoff_id", 0))
+                if signoff_id:
+                    self._receipt_by_signoff[signoff_id] = dict(receipt)
+
+    def list_signoffs(self, sample_id: int | None = None) -> list[dict[str, Any]]:
+        """返回签结存档；可按小样过滤。存档本身不可变，调用方拿到副本。"""
+        if sample_id is not None:
+            return [dict(item) for item in self._blend_signoffs.get(sample_id, [])]
+        result: list[dict[str, Any]] = []
+        for items in self._blend_signoffs.values():
+            result.extend(dict(item) for item in items)
+        return result
+
+    def find_signoff(self, signoff_id: int) -> dict[str, Any] | None:
+        for items in self._blend_signoffs.values():
+            for item in items:
+                if int(item.get("id", 0)) == signoff_id:
+                    return dict(item)
+        return None
+
+    def append_signoff(self, signoff: dict[str, Any]) -> None:
+        sample_id = int(signoff["sample_id"])
+        self._blend_signoffs.setdefault(sample_id, []).append(dict(signoff))
+
+    def next_signoff_id(self) -> int:
+        max_id = 0
+        for items in self._blend_signoffs.values():
+            for item in items:
+                max_id = max(max_id, int(item.get("id", 0)))
+        return max_id + 1
+
+    def list_receipts(self, blend_id: int | None = None) -> list[dict[str, Any]]:
+        receipts = self._blend_receipts
+        if blend_id is not None:
+            receipts = [r for r in receipts if int(r.get("blend_id", 0)) == blend_id]
+        return [dict(item) for item in receipts]
+
+    def find_receipt_by_signoff(self, signoff_id: int) -> dict[str, Any] | None:
+        receipt = self._receipt_by_signoff.get(signoff_id)
+        return dict(receipt) if receipt else None
+
+    def save_receipt(self, receipt: dict[str, Any]) -> None:
+        self._blend_receipts.append(dict(receipt))
+        self._receipt_by_signoff[int(receipt["signoff_id"])] = dict(receipt)
+
+    def next_receipt_no(self) -> str:
+        return f"BLENDR-{len(self._blend_receipts) + 1:04d}"
 
     # ── 种子血缘初始化 ──
 
